@@ -9,6 +9,16 @@ On widely used distros this should all "just work".
 
 Alternatively, you can use tools that rely on the `ext-image-copy-capture` protocol, or the older `wlr-screencopy`, both of which niri also supports.
 
+### Remote desktop
+
+Niri implements GNOME's RemoteDesktop D-Bus interface. This lets `xdg-desktop-portal-gnome` provide remote input through the XDG Desktop Portal.
+
+Remote sessions can send keyboard, pointer, and touch input. Niri accepts input only from the portal backend that created the session, and only while the session is active. It releases held inputs when a session ends.
+
+Remote desktop support is a build-time feature. It is enabled by default in Niri's Nix flake package. Builds without the feature do not provide this interface.
+
+Clipboard support is not implemented. Absolute pointer input is supported for monitor streams. It is not supported for window streams because Niri does not currently expose their live geometry.
+
 There are several features in niri designed for screencasting.
 Let's take a look!
 

@@ -160,6 +160,8 @@ use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
+#[cfg(feature = "xdp-gnome-remote-desktop")]
+use crate::remote_desktop::RemoteDesktopState;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
@@ -435,6 +437,8 @@ pub struct Niri {
 
     #[cfg(feature = "xdp-gnome-screencast")]
     pub casting: Screencasting,
+    #[cfg(feature = "xdp-gnome-remote-desktop")]
+    pub remote_desktop: RemoteDesktopState,
 
     #[cfg(test)]
     pub test_action_count: usize,
@@ -834,6 +838,13 @@ impl State {
 
         // Needs to be called after updating the keyboard focus.
         self.niri.refresh_layout();
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        self.niri.remote_desktop.set_selected_output(
+            self.niri
+                .layout
+                .active_output()
+                .map(|output| output.name().to_owned()),
+        );
 
         self.niri.cursor_manager.check_cursor_image_surface_alive();
         self.niri.refresh_pointer_outputs();
@@ -2079,6 +2090,8 @@ impl State {
                 .map(logical_output);
             ipc_output.logical = logical;
         }
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        self.on_ipc_outputs_changed_remote_desktop();
 
         #[cfg(feature = "dbus")]
         self.niri.on_ipc_outputs_changed();
@@ -2779,6 +2792,8 @@ impl Niri {
 
             #[cfg(feature = "xdp-gnome-screencast")]
             casting: screencasting,
+            #[cfg(feature = "xdp-gnome-remote-desktop")]
+            remote_desktop: RemoteDesktopState::default(),
 
             #[cfg(test)]
             test_action_count: 0,

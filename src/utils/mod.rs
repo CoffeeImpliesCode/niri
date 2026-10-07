@@ -34,6 +34,7 @@ use smithay::wayland::shell::xdg::{
 };
 use wayland_backend::server::Credentials;
 
+use crate::backend::IpcOutputMap;
 use crate::handlers::KdeDecorationsModeState;
 use crate::niri::ClientState;
 
@@ -73,6 +74,33 @@ impl Display for CastSessionId {
 }
 
 impl From<u64> for CastSessionId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Unique ID for a remote desktop session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RemoteDesktopSessionId(u64);
+
+impl RemoteDesktopSessionId {
+    pub fn next() -> Self {
+        static COUNTER: IdCounter = IdCounter::new();
+        Self(COUNTER.next())
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl Display for RemoteDesktopSessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<u64> for RemoteDesktopSessionId {
     fn from(value: u64) -> Self {
         Self(value)
     }
@@ -227,6 +255,42 @@ pub fn logical_output(output: &Output) -> niri_ipc::LogicalOutput {
         scale: output.current_scale().fractional_scale(),
         transform,
     }
+}
+
+/// Returns the smallest logical rectangle that contains all mapped outputs.
+pub fn global_bounding_rectangle_ipc(outputs: &IpcOutputMap) -> Option<Rectangle<i32, Logical>> {
+    global_bounding_rectangle(outputs.values().filter_map(|output| output.logical))
+}
+
+fn global_bounding_rectangle(
+    logical_outputs: impl Iterator<Item = niri_ipc::LogicalOutput>,
+) -> Option<Rectangle<i32, Logical>> {
+    let mut min_x = i64::MAX;
+    let mut min_y = i64::MAX;
+    let mut max_x = i64::MIN;
+    let mut max_y = i64::MIN;
+
+    for logical in logical_outputs {
+        if logical.width == 0 || logical.height == 0 {
+            continue;
+        }
+        let x = i64::from(logical.x);
+        let y = i64::from(logical.y);
+        min_x = Ord::min(min_x, x);
+        min_y = Ord::min(min_y, y);
+        max_x = Ord::max(max_x, x + i64::from(logical.width));
+        max_y = Ord::max(max_y, y + i64::from(logical.height));
+    }
+
+    if min_x == i64::MAX {
+        return None;
+    }
+    let loc = Point::new(i32::try_from(min_x).ok()?, i32::try_from(min_y).ok()?);
+    let size = Size::new(
+        i32::try_from(max_x - min_x).ok()?,
+        i32::try_from(max_y - min_y).ok()?,
+    );
+    (size.w > 0 && size.h > 0).then_some(Rectangle::new(loc, size))
 }
 
 pub struct PanelOrientation(pub Transform);
@@ -610,6 +674,48 @@ pub fn cause_panic() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn logical_geometry(x: i32, y: i32, width: u32, height: u32) -> niri_ipc::LogicalOutput {
+        niri_ipc::LogicalOutput {
+            x,
+            y,
+            width,
+            height,
+            scale: 1.0,
+            transform: niri_ipc::Transform::Normal,
+        }
+    }
+
+    #[test]
+    fn global_bounds_use_logical_geometry_and_negative_origins() {
+        let bounds = global_bounding_rectangle(
+            [
+                logical_geometry(-1280, 100, 1280, 720),
+                logical_geometry(0, 0, 1920, 1080),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(bounds.loc, Point::from((-1280, 0)));
+        assert_eq!(bounds.size, Size::from((3200, 1080)));
+    }
+
+    #[test]
+    fn global_bounds_reject_empty_or_unmapped_geometry() {
+        assert!(global_bounding_rectangle(std::iter::empty()).is_none());
+        assert!(global_bounding_rectangle([logical_geometry(0, 0, 0, 10)].into_iter()).is_none());
+        let bounds = global_bounding_rectangle(
+            [
+                logical_geometry(5, 5, 100, 100),
+                logical_geometry(-1000, 0, 0, 10),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(bounds.loc, Point::from((5, 5)));
+        assert_eq!(bounds.size, Size::from((100, 100)));
+    }
 
     #[test]
     fn test_clamp_preferring_top_left() {

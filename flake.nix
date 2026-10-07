@@ -32,6 +32,7 @@
           withDbus ? true,
           withSystemd ? true,
           withScreencastSupport ? true,
+          withRemoteDesktopSupport ? true,
           withDinit ? false,
         }:
 
@@ -86,8 +87,8 @@
               pango
               wayland
             ]
-            ++ lib.optional (withDbus || withScreencastSupport || withSystemd) dbus
-            ++ lib.optional withScreencastSupport pipewire
+            ++ lib.optional (withDbus || withScreencastSupport || withSystemd || withRemoteDesktopSupport) dbus
+            ++ lib.optional (withScreencastSupport || withRemoteDesktopSupport) pipewire
             # Also includes libudev
             ++ lib.optional withSystemd systemd;
 
@@ -95,6 +96,7 @@
             lib.optional withDbus "dbus"
             ++ lib.optional withDinit "dinit"
             ++ lib.optional withScreencastSupport "xdp-gnome-screencast"
+            ++ lib.optional withRemoteDesktopSupport "xdp-gnome-remote-desktop"
             ++ lib.optional withSystemd "systemd";
           buildNoDefaultFeatures = true;
 

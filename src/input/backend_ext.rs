@@ -21,6 +21,11 @@ pub trait NiriInputDevice: input::Device {
     // but it's not clear that this matters in practice?
     // it might be more obvious once we implement it for libinput
     fn output(&self, state: &State) -> Option<Output>;
+    /// Keyboard source for origin-aware input tracking. Only meaningful for keyboard-capable
+    /// devices. Defaults to MAIN for devices without a specific source.
+    fn source(&self) -> smithay::input::keyboard::KeyboardSource {
+        smithay::input::keyboard::KeyboardSource::MAIN
+    }
 }
 
 impl NiriInputDevice for libinput::Device {

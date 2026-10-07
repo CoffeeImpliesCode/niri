@@ -387,7 +387,7 @@ impl State {
 
     pub fn on_screen_cast_msg(&mut self, msg: ScreenCastToNiri) {
         match msg {
-            ScreenCastToNiri::StartCast {
+            ScreenCastToNiri::StartStream {
                 session_id,
                 stream_id,
                 target,
@@ -463,7 +463,7 @@ impl State {
                     }
                 }
             }
-            ScreenCastToNiri::StopCast { session_id } => self.niri.stop_cast(session_id),
+            ScreenCastToNiri::StopCast { session_id, .. } => self.niri.stop_cast(session_id),
         }
     }
 }
@@ -733,10 +733,11 @@ impl Niri {
             let _span = tracy_client::span!("invoking Session::stop");
 
             async_io::block_on(async move {
-                iface
-                    .get()
-                    .stop(server.inner(), iface.signal_emitter().clone())
-                    .await
+                let signal_emitter = iface.signal_emitter().clone();
+                let mut session = iface.get_mut();
+                session
+                    .stop_from_stopcast(server.inner(), &signal_emitter)
+                    .await;
             });
         }
     }

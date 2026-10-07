@@ -1,33 +1,243 @@
-use std::collections::HashMap;
 use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex as StdMutex};
 
+use futures_util::lock::Mutex;
 use serde::Deserialize;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
 use zbus::zvariant::{DeserializeDict, OwnedObjectPath, SerializeDict, Type, Value};
 use zbus::{fdo, interface, ObjectServer};
 
-use super::{request_name, Start};
+use super::Start;
 use crate::backend::IpcOutputMap;
+#[cfg(feature = "xdp-gnome-remote-desktop")]
+use crate::dbus::mutter_remote_desktop::shared::RemoteDesktopShared;
 use crate::utils::{CastSessionId, CastStreamId};
+
+pub enum ScreenCastToNiri {
+    /// Starts a stream associated with a screencast session.
+    StartStream {
+        session_id: CastSessionId,
+        stream_id: CastStreamId,
+        target: StreamTargetId,
+        cursor_mode: CursorMode,
+        signal_ctx: SignalEmitter<'static>,
+    },
+    /// Stops all streams associated with the specified screencast session.
+    StopCast {
+        session_id: CastSessionId,
+        /// The reason for stopping the screencast, mainly for debugging.
+        reason: StopCastReason,
+    },
+}
+
+#[derive(Debug)]
+pub enum StopCastReason {
+    RemoteDesktopStopped,
+    FromNiriStopCast,
+    DbusStop,
+    SessionDropped,
+}
+
+// == ROOT INTERFACE ==
 
 #[derive(Clone)]
 pub struct ScreenCast {
-    ipc_outputs: Arc<Mutex<IpcOutputMap>>,
+    ipc_outputs: Arc<StdMutex<IpcOutputMap>>,
     to_niri: calloop::channel::Sender<ScreenCastToNiri>,
-    #[allow(clippy::type_complexity)]
-    sessions: Arc<Mutex<Vec<(Session, InterfaceRef<Session>)>>>,
+    #[cfg(feature = "xdp-gnome-remote-desktop")]
+    remote_desktop_shared: Arc<Mutex<RemoteDesktopShared>>,
+    #[cfg(feature = "xdp-gnome-remote-desktop")]
+    remote_desktop_object_server: Option<ObjectServer>,
+    #[cfg(feature = "xdp-gnome-remote-desktop")]
+    selected_output: Arc<StdMutex<Option<String>>>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, DeserializeDict, Type)]
+#[zvariant(signature = "dict")]
+struct CreateSessionProperties {
+    #[zvariant(rename = "remote-desktop-session-id")]
+    remote_desktop_session_id: Option<String>,
+}
+
+#[interface(name = "org.gnome.Mutter.ScreenCast")]
+impl ScreenCast {
+    async fn create_session(
+        &self,
+        #[zbus(object_server)] server: &ObjectServer,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        properties: CreateSessionProperties,
+    ) -> fdo::Result<OwnedObjectPath> {
+        // Handle the case where remote desktop is disabled at compile time
+        #[cfg(not(feature = "xdp-gnome-remote-desktop"))]
+        {
+            if properties.remote_desktop_session_id.is_some() {
+                return Err(fdo::Error::Failed(
+                    "Remote desktop support has been disabled at compile time in Niri".to_owned(),
+                ));
+            }
+            let _ = (&header, connection);
+        }
+
+        // Get the remote desktop session interface if a session ID was provided
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        let rd_session_iface = {
+            if let Some(rd_session_id) = properties.remote_desktop_session_id {
+                use crate::utils::RemoteDesktopSessionId;
+
+                debug!(rd_session_id, "ScreenCast.CreateSession");
+                let rd_session_id: u64 = rd_session_id.parse().map_err(|err| {
+                    fdo::Error::Failed(format!("Invalid remote desktop session ID: {err}"))
+                })?;
+                let rd_session_id = RemoteDesktopSessionId::from(rd_session_id);
+                let shared = self.remote_desktop_shared.lock().await;
+                let iface = shared
+                    .sessions
+                    .get(&rd_session_id)
+                    .ok_or(fdo::Error::Failed(
+                        "No matching remote desktop session".to_owned(),
+                    ))?
+                    .clone();
+                drop(shared);
+
+                iface
+                    .get()
+                    .await
+                    .authorize_linked_screencast(connection, &header)
+                    .await?;
+                Some(iface)
+            } else {
+                None
+            }
+        };
+
+        // Get the remote desktop session state if we have a session interface
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        let rd_session_state = {
+            if let Some(iface) = &rd_session_iface {
+                let state = iface.get_mut().await;
+
+                if state.active {
+                    return Err(fdo::Error::Failed(
+                        "The remote desktop session has already started".to_owned(),
+                    ));
+                }
+
+                if state.screen_cast_session.is_some() {
+                    return Err(fdo::Error::Failed(
+                        "The remote desktop session already has an associated screencast session"
+                            .to_owned(),
+                    ));
+                }
+
+                Some(state)
+            } else {
+                None
+            }
+        };
+
+        let session_id = CastSessionId::next();
+        let path = format!("/org/gnome/Mutter/ScreenCast/Session/u{}", session_id.get());
+        let path = OwnedObjectPath::try_from(path).unwrap();
+
+        let session = Session {
+            id: session_id,
+            ipc_outputs: self.ipc_outputs.clone(),
+            streams: Arc::new(Mutex::new(vec![])),
+            to_niri: self.to_niri.clone(),
+            stopped: Arc::new(AtomicBool::new(false)),
+            sent_stop_cast: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "xdp-gnome-remote-desktop")]
+            selected_output: self.selected_output.clone(),
+            #[cfg(feature = "xdp-gnome-remote-desktop")]
+            rd_session: rd_session_iface.as_ref().and_then(|iface| {
+                Some((
+                    iface.clone(),
+                    self.remote_desktop_object_server.as_ref()?.clone(),
+                ))
+            }),
+        };
+
+        match server.at(&path, session).await {
+            Ok(true) => {
+                #[cfg(feature = "xdp-gnome-remote-desktop")]
+                {
+                    let iface: InterfaceRef<Session> = server.interface(&path).await.unwrap();
+                    if let Some(mut state) = rd_session_state {
+                        state.screen_cast_session = Some((iface, server.clone()));
+                    }
+                }
+            }
+            Ok(false) => return Err(fdo::Error::Failed("session path already exists".to_owned())),
+            Err(err) => {
+                return Err(fdo::Error::Failed(format!(
+                    "error creating session object: {err:?}"
+                )))
+            }
+        }
+
+        Ok(path)
+    }
+
+    #[zbus(property)]
+    async fn version(&self) -> i32 {
+        4
+    }
+}
+
+impl ScreenCast {
+    pub fn new(
+        ipc_outputs: Arc<StdMutex<IpcOutputMap>>,
+        to_niri: calloop::channel::Sender<ScreenCastToNiri>,
+        #[cfg(feature = "xdp-gnome-remote-desktop")] remote_desktop_shared: Arc<
+            Mutex<RemoteDesktopShared>,
+        >,
+        #[cfg(feature = "xdp-gnome-remote-desktop")] remote_desktop_object_server: Option<
+            ObjectServer,
+        >,
+        #[cfg(feature = "xdp-gnome-remote-desktop")] selected_output: Arc<StdMutex<Option<String>>>,
+    ) -> Self {
+        Self {
+            ipc_outputs,
+            to_niri,
+            #[cfg(feature = "xdp-gnome-remote-desktop")]
+            remote_desktop_shared,
+            #[cfg(feature = "xdp-gnome-remote-desktop")]
+            remote_desktop_object_server,
+            #[cfg(feature = "xdp-gnome-remote-desktop")]
+            selected_output,
+        }
+    }
+}
+
+impl Start for ScreenCast {
+    fn start(self, monitor: bool) -> anyhow::Result<zbus::blocking::Connection> {
+        let conn = zbus::blocking::Connection::session()?;
+        conn.object_server()
+            .at("/org/gnome/Mutter/ScreenCast", self)?;
+        super::request_name(&conn, "org.gnome.Mutter.ScreenCast", monitor)?;
+        Ok(conn)
+    }
+}
+
+// == SESSION ==
+
 pub struct Session {
     id: CastSessionId,
-    ipc_outputs: Arc<Mutex<IpcOutputMap>>,
+    pub ipc_outputs: Arc<StdMutex<IpcOutputMap>>,
     to_niri: calloop::channel::Sender<ScreenCastToNiri>,
     #[allow(clippy::type_complexity)]
-    streams: Arc<Mutex<Vec<(Stream, InterfaceRef<Stream>)>>>,
+    streams: Arc<Mutex<Vec<InterfaceRef<Stream>>>>,
     stopped: Arc<AtomicBool>,
+    sent_stop_cast: Arc<AtomicBool>,
+    #[cfg(feature = "xdp-gnome-remote-desktop")]
+    selected_output: Arc<StdMutex<Option<String>>>,
+    #[cfg(feature = "xdp-gnome-remote-desktop")]
+    rd_session: Option<(
+        InterfaceRef<super::mutter_remote_desktop::Session>,
+        ObjectServer,
+    )>,
 }
 
 #[derive(Debug, Default, Deserialize, Type, Clone, Copy, PartialEq, Eq)]
@@ -58,123 +268,205 @@ struct RecordWindowProperties {
     _is_recording: Option<bool>,
 }
 
-#[derive(Clone)]
-pub struct Stream {
-    id: CastStreamId,
-    session_id: CastSessionId,
-    target: StreamTarget,
-    cursor_mode: CursorMode,
-    was_started: Arc<AtomicBool>,
-    to_niri: calloop::channel::Sender<ScreenCastToNiri>,
-}
+#[interface(name = "org.gnome.Mutter.ScreenCast.Session")]
+impl Session {
+    /// Starts the streams of this screencast session.
+    #[zbus(name = "Start")]
+    async fn start_dbus(&self) -> fdo::Result<()> {
+        debug!("start");
 
-#[derive(Clone)]
-enum StreamTarget {
-    // FIXME: update on scale changes and whatnot.
-    Output(niri_ipc::Output),
-    Window { id: u64 },
-}
-
-#[derive(Debug, Clone)]
-pub enum StreamTargetId {
-    Output { name: String },
-    Window { id: u64 },
-}
-
-#[derive(Debug, SerializeDict, Type, Value)]
-#[zvariant(signature = "dict")]
-struct StreamParameters {
-    /// Position of the stream in logical coordinates.
-    position: (i32, i32),
-    /// Size of the stream in logical coordinates.
-    size: (i32, i32),
-}
-
-pub enum ScreenCastToNiri {
-    StartCast {
-        session_id: CastSessionId,
-        stream_id: CastStreamId,
-        target: StreamTargetId,
-        cursor_mode: CursorMode,
-        signal_ctx: SignalEmitter<'static>,
-    },
-    StopCast {
-        session_id: CastSessionId,
-    },
-}
-
-#[interface(name = "org.gnome.Mutter.ScreenCast")]
-impl ScreenCast {
-    async fn create_session(
-        &self,
-        #[zbus(object_server)] server: &ObjectServer,
-        properties: HashMap<&str, Value<'_>>,
-    ) -> fdo::Result<OwnedObjectPath> {
-        if properties.contains_key("remote-desktop-session-id") {
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        if self.rd_session.is_some() {
             return Err(fdo::Error::Failed(
-                "there are no remote desktop sessions".to_owned(),
+                "This session must be started from the linked remote desktop session".to_owned(),
             ));
         }
 
-        let session_id = CastSessionId::next();
-        let path = format!("/org/gnome/Mutter/ScreenCast/Session/u{}", session_id.get());
-        let path = OwnedObjectPath::try_from(path).unwrap();
-
-        let session = Session::new(session_id, self.ipc_outputs.clone(), self.to_niri.clone());
-        match server.at(&path, session.clone()).await {
-            Ok(true) => {
-                let iface = server.interface(&path).await.unwrap();
-                self.sessions.lock().unwrap().push((session, iface));
-            }
-            Ok(false) => return Err(fdo::Error::Failed("session path already exists".to_owned())),
-            Err(err) => {
-                return Err(fdo::Error::Failed(format!(
-                    "error creating session object: {err:?}"
-                )))
-            }
-        }
-
-        Ok(path)
+        self.start().await;
+        Ok(())
     }
 
-    #[zbus(property)]
-    async fn version(&self) -> i32 {
-        4
-    }
-}
-
-#[interface(name = "org.gnome.Mutter.ScreenCast.Session")]
-impl Session {
-    async fn start(&self) {
-        debug!("start");
-
-        for (stream, iface) in &*self.streams.lock().unwrap() {
-            stream.start(iface.signal_emitter().clone());
-        }
-    }
-
-    pub async fn stop(
-        &self,
+    #[zbus(name = "Stop")]
+    async fn stop_dbus(
+        &mut self,
         #[zbus(object_server)] server: &ObjectServer,
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
-    ) {
+    ) -> fdo::Result<()> {
         debug!("stop");
 
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        if self.rd_session.is_some() {
+            return Err(fdo::Error::Failed(
+                "This session must be stopped from the linked remote desktop session".to_owned(),
+            ));
+        }
+
+        self.stop(server, &ctxt, StopCastReason::DbusStop).await;
+        Ok(())
+    }
+
+    /// Creates a [`Stream`] that records a monitor.
+    async fn record_monitor(
+        &mut self,
+        #[zbus(object_server)] server: &ObjectServer,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        connector: &str,
+        properties: RecordMonitorProperties,
+    ) -> fdo::Result<OwnedObjectPath> {
+        self.authorize_linked_request(connection, &header).await?;
+        debug!(connector, ?properties, "record_monitor");
+
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        let current_selection = self
+            .selected_output
+            .lock()
+            .ok()
+            .and_then(|selected| selected.clone());
+        #[cfg(not(feature = "xdp-gnome-remote-desktop"))]
+        let current_selection = None;
+        let selected_output =
+            requested_output_name(connector, current_selection.as_deref()).map(str::to_owned);
+
+        let output = {
+            let ipc_outputs = self.ipc_outputs.lock().unwrap();
+            selected_output
+                .as_deref()
+                .and_then(|name| ipc_outputs.values().find(|o| o.name == name).cloned())
+        };
+        let Some(output) = output else {
+            let message = if connector.is_empty() {
+                "No selected monitor is available for an empty connector".to_owned()
+            } else {
+                format!("No such monitor with connector/name: {connector}")
+            };
+            return Err(fdo::Error::Failed(message));
+        };
+        validate_logical_geometry(&output.name, output.logical.as_ref())?;
+        let target = StreamTarget::Output(output);
+        let cursor_mode = properties.cursor_mode.unwrap_or_default();
+
+        self.record_shared(target, cursor_mode, server).await
+    }
+
+    /// Creates a [`Stream`] that records a window.
+    async fn record_window(
+        &mut self,
+        #[zbus(object_server)] server: &ObjectServer,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        properties: RecordWindowProperties,
+    ) -> fdo::Result<OwnedObjectPath> {
+        self.authorize_linked_request(connection, &header).await?;
+        debug!(?properties, "record_window");
+
+        let target = StreamTarget::Window {
+            id: properties.window_id,
+        };
+        let cursor_mode = properties.cursor_mode.unwrap_or_default();
+
+        self.record_shared(target, cursor_mode, server).await
+    }
+
+    /// Event that the session has closed.
+    #[zbus(signal)]
+    async fn closed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
+}
+
+impl Session {
+    async fn authorize_linked_request(
+        &self,
+        connection: &zbus::Connection,
+        header: &zbus::message::Header<'_>,
+    ) -> fdo::Result<()> {
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        if let Some((iface, _)) = &self.rd_session {
+            iface
+                .get()
+                .await
+                .authorize_linked_screencast(connection, header)
+                .await?;
+        }
+
+        #[cfg(not(feature = "xdp-gnome-remote-desktop"))]
+        let _ = (connection, header);
+
+        Ok(())
+    }
+
+    pub async fn start(&self) {
+        for iface in &*self.streams.lock().await {
+            iface.get().await.start(iface.signal_emitter().clone());
+        }
+    }
+
+    /// Stops the session.
+    async fn stop(
+        &mut self,
+        server: &ObjectServer,
+        ctxt: &SignalEmitter<'_>,
+        reason: StopCastReason,
+    ) {
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        let remote_desktop_session = self
+            .rd_session
+            .as_ref()
+            .map(|(iface, server)| (iface.clone(), server.clone()));
+
+        if self.stop_inner(server, ctxt, reason).await {
+            #[cfg(feature = "xdp-gnome-remote-desktop")]
+            if let Some((iface, server)) = remote_desktop_session {
+                iface
+                    .get_mut()
+                    .await
+                    .stop(&server, iface.signal_emitter())
+                    .await;
+            }
+        }
+    }
+    pub async fn stop_from_stopcast(&mut self, server: &ObjectServer, ctxt: &SignalEmitter<'_>) {
+        self.stop(server, ctxt, StopCastReason::FromNiriStopCast)
+            .await
+    }
+
+    /// Stops the session without trying to stop any associated remote desktop session.
+    #[cfg(feature = "xdp-gnome-remote-desktop")]
+    pub(super) async fn stop_no_remote_desktop(
+        &mut self,
+        server: &ObjectServer,
+        ctxt: &SignalEmitter<'_>,
+    ) {
+        self.stop_inner(server, ctxt, StopCastReason::RemoteDesktopStopped)
+            .await;
+    }
+
+    async fn stop_inner(
+        &mut self,
+        server: &ObjectServer,
+        ctxt: &SignalEmitter<'_>,
+        reason: StopCastReason,
+    ) -> bool {
         if self.stopped.swap(true, Ordering::SeqCst) {
             // Already stopped.
-            return;
+            return false;
         }
 
-        Session::closed(&ctxt).await.unwrap();
+        // Remove reference to the remote desktop interface so it can be dropped
+        self.rd_session = None;
 
-        if let Err(err) = self.to_niri.send(ScreenCastToNiri::StopCast {
-            session_id: self.id,
-        }) {
-            warn!("error sending StopCast to niri: {err:?}");
+        Session::closed(ctxt).await.unwrap();
+
+        if !self.sent_stop_cast.swap(true, Ordering::SeqCst) {
+            if let Err(err) = self.to_niri.send(ScreenCastToNiri::StopCast {
+                session_id: self.id,
+                reason,
+            }) {
+                warn!("error sending StopCast to niri: {err:?}");
+            }
         }
 
-        let streams = mem::take(&mut *self.streams.lock().unwrap());
-        for (_, iface) in streams.iter() {
+        let streams = mem::take(&mut *self.streams.lock().await);
+        for iface in streams.iter() {
             server
                 .remove::<Stream, _>(iface.signal_emitter().path())
                 .await
@@ -182,46 +474,35 @@ impl Session {
         }
 
         server.remove::<Session, _>(ctxt.path()).await.unwrap();
+
+        true
     }
 
-    async fn record_monitor(
+    async fn record_shared(
         &mut self,
-        #[zbus(object_server)] server: &ObjectServer,
-        connector: &str,
-        properties: RecordMonitorProperties,
+        target: StreamTarget,
+        cursor_mode: CursorMode,
+        server: &ObjectServer,
     ) -> fdo::Result<OwnedObjectPath> {
-        debug!(connector, ?properties, "record_monitor");
-
-        let output = {
-            let ipc_outputs = self.ipc_outputs.lock().unwrap();
-            ipc_outputs.values().find(|o| o.name == connector).cloned()
-        };
-        let Some(output) = output else {
-            return Err(fdo::Error::Failed("no such monitor".to_owned()));
-        };
-
-        if output.logical.is_none() {
-            return Err(fdo::Error::Failed("monitor is disabled".to_owned()));
-        }
-
         let stream_id = CastStreamId::next();
         let path = format!("/org/gnome/Mutter/ScreenCast/Stream/u{}", stream_id.get());
         let path = OwnedObjectPath::try_from(path).unwrap();
 
-        let cursor_mode = properties.cursor_mode.unwrap_or_default();
-
-        let target = StreamTarget::Output(output);
-        let stream = Stream::new(
-            stream_id,
-            self.id,
+        let stream = Stream {
+            id: stream_id,
+            session_id: self.id,
             target,
             cursor_mode,
-            self.to_niri.clone(),
-        );
-        match server.at(&path, stream.clone()).await {
+            was_started: Arc::new(AtomicBool::new(false)),
+            to_niri: self.to_niri.clone(),
+            #[cfg(feature = "xdp-gnome-remote-desktop")]
+            rd_session: self.rd_session.as_ref().map(|(iface, _)| iface.clone()),
+        };
+
+        match server.at(&path, stream).await {
             Ok(true) => {
                 let iface = server.interface(&path).await.unwrap();
-                self.streams.lock().unwrap().push((stream, iface));
+                self.streams.lock().await.push(iface);
             }
             Ok(false) => return Err(fdo::Error::Failed("stream path already exists".to_owned())),
             Err(err) => {
@@ -232,161 +513,38 @@ impl Session {
         }
 
         Ok(path)
-    }
-
-    async fn record_window(
-        &mut self,
-        #[zbus(object_server)] server: &ObjectServer,
-        properties: RecordWindowProperties,
-    ) -> fdo::Result<OwnedObjectPath> {
-        debug!(?properties, "record_window");
-
-        let stream_id = CastStreamId::next();
-        let path = format!("/org/gnome/Mutter/ScreenCast/Stream/u{}", stream_id.get());
-        let path = OwnedObjectPath::try_from(path).unwrap();
-
-        let cursor_mode = properties.cursor_mode.unwrap_or_default();
-
-        let target = StreamTarget::Window {
-            id: properties.window_id,
-        };
-        let stream = Stream::new(
-            stream_id,
-            self.id,
-            target,
-            cursor_mode,
-            self.to_niri.clone(),
-        );
-        match server.at(&path, stream.clone()).await {
-            Ok(true) => {
-                let iface = server.interface(&path).await.unwrap();
-                self.streams.lock().unwrap().push((stream, iface));
-            }
-            Ok(false) => return Err(fdo::Error::Failed("stream path already exists".to_owned())),
-            Err(err) => {
-                return Err(fdo::Error::Failed(format!(
-                    "error creating stream object: {err:?}"
-                )))
-            }
-        }
-
-        Ok(path)
-    }
-
-    #[zbus(signal)]
-    async fn closed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
-}
-
-#[interface(name = "org.gnome.Mutter.ScreenCast.Stream")]
-impl Stream {
-    #[zbus(signal)]
-    pub async fn pipe_wire_stream_added(ctxt: &SignalEmitter<'_>, node_id: u32)
-        -> zbus::Result<()>;
-
-    #[zbus(property)]
-    async fn parameters(&self) -> StreamParameters {
-        match &self.target {
-            StreamTarget::Output(output) => {
-                let logical = output.logical.as_ref().unwrap();
-                StreamParameters {
-                    position: (logical.x, logical.y),
-                    size: (logical.width as i32, logical.height as i32),
-                }
-            }
-            StreamTarget::Window { .. } => {
-                // Does any consumer need this?
-                StreamParameters {
-                    position: (0, 0),
-                    size: (1, 1),
-                }
-            }
-        }
-    }
-}
-
-impl ScreenCast {
-    pub fn new(
-        ipc_outputs: Arc<Mutex<IpcOutputMap>>,
-        to_niri: calloop::channel::Sender<ScreenCastToNiri>,
-    ) -> Self {
-        Self {
-            ipc_outputs,
-            to_niri,
-            sessions: Arc::new(Mutex::new(vec![])),
-        }
-    }
-}
-
-impl Start for ScreenCast {
-    fn start(self, monitor: bool) -> anyhow::Result<zbus::blocking::Connection> {
-        let conn = zbus::blocking::Connection::session()?;
-        conn.object_server()
-            .at("/org/gnome/Mutter/ScreenCast", self)?;
-        request_name(&conn, "org.gnome.Mutter.ScreenCast", monitor)?;
-
-        Ok(conn)
-    }
-}
-
-impl Session {
-    pub fn new(
-        id: CastSessionId,
-        ipc_outputs: Arc<Mutex<IpcOutputMap>>,
-        to_niri: calloop::channel::Sender<ScreenCastToNiri>,
-    ) -> Self {
-        Self {
-            id,
-            ipc_outputs,
-            streams: Arc::new(Mutex::new(vec![])),
-            to_niri,
-            stopped: Arc::new(AtomicBool::new(false)),
-        }
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.to_niri.send(ScreenCastToNiri::StopCast {
-            session_id: self.id,
-        });
+        if !self.sent_stop_cast.swap(true, Ordering::SeqCst) {
+            let _ = self.to_niri.send(ScreenCastToNiri::StopCast {
+                session_id: self.id,
+                reason: StopCastReason::SessionDropped,
+            });
+        }
     }
 }
 
-impl Stream {
-    fn new(
-        id: CastStreamId,
-        session_id: CastSessionId,
-        target: StreamTarget,
-        cursor_mode: CursorMode,
-        to_niri: calloop::channel::Sender<ScreenCastToNiri>,
-    ) -> Self {
-        Self {
-            id,
-            session_id,
-            target,
-            cursor_mode,
-            was_started: Arc::new(AtomicBool::new(false)),
-            to_niri,
-        }
-    }
+// == STREAM ==
 
-    fn start(&self, ctxt: SignalEmitter<'static>) {
-        if self.was_started.load(Ordering::SeqCst) {
-            return;
-        }
+pub struct Stream {
+    id: CastStreamId,
+    session_id: CastSessionId,
+    target: StreamTarget,
+    cursor_mode: CursorMode,
+    was_started: Arc<AtomicBool>,
+    to_niri: calloop::channel::Sender<ScreenCastToNiri>,
+    #[cfg(feature = "xdp-gnome-remote-desktop")]
+    rd_session: Option<InterfaceRef<super::mutter_remote_desktop::Session>>,
+}
 
-        let msg = ScreenCastToNiri::StartCast {
-            session_id: self.session_id,
-            stream_id: self.id,
-            target: self.target.make_id(),
-            cursor_mode: self.cursor_mode,
-            signal_ctx: ctxt,
-        };
-
-        if let Err(err) = self.to_niri.send(msg) {
-            warn!("error sending StartCast to niri: {err:?}");
-        }
-    }
+#[derive(Clone)]
+enum StreamTarget {
+    // FIXME: update on scale changes and whatnot.
+    Output(niri_ipc::Output),
+    Window { id: u64 },
 }
 
 impl StreamTarget {
@@ -397,5 +555,195 @@ impl StreamTarget {
             },
             StreamTarget::Window { id } => StreamTargetId::Window { id: *id },
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum StreamTargetId {
+    Output { name: String },
+    Window { id: u64 },
+}
+
+#[derive(Debug, SerializeDict, Type, Value)]
+#[zvariant(signature = "dict")]
+pub struct StreamParameters {
+    /// Position of the stream in logical coordinates.
+    pub position: (i32, i32),
+    /// Size of the stream in logical coordinates.
+    pub size: (i32, i32),
+    /// Unique identifier used to map the stream to a corresponding region on an EI
+    /// absolute device (remote desktop).
+    ///
+    /// Currently output names (like eDP-1) are used.
+    #[zvariant(rename = "mapping-id")]
+    pub mapping_id: Option<String>,
+}
+
+#[interface(name = "org.gnome.Mutter.ScreenCast.Stream")]
+impl Stream {
+    #[zbus(signal)]
+    pub async fn pipe_wire_stream_added(ctxt: &SignalEmitter<'_>, node_id: u32)
+        -> zbus::Result<()>;
+
+    #[zbus(property)]
+    pub(crate) async fn parameters(
+        &self,
+        #[zbus(header)] header: Option<zbus::message::Header<'_>>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> fdo::Result<StreamParameters> {
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        if let Some(iface) = &self.rd_session {
+            let header = header.as_ref().ok_or_else(|| {
+                fdo::Error::Failed("Missing D-Bus message header for authorization".to_owned())
+            })?;
+            iface
+                .get()
+                .await
+                .authorize_linked_screencast(connection, header)
+                .await?;
+        }
+
+        #[cfg(not(feature = "xdp-gnome-remote-desktop"))]
+        let _ = (&header, connection);
+        Ok(match &self.target {
+            StreamTarget::Output(output) => {
+                let logical = output.logical.as_ref().unwrap();
+                StreamParameters {
+                    position: (logical.x, logical.y),
+                    size: (logical.width as i32, logical.height as i32),
+                    #[cfg(feature = "xdp-gnome-remote-desktop")]
+                    mapping_id: self.rd_session.is_some().then(|| output.name.clone()),
+                    #[cfg(not(feature = "xdp-gnome-remote-desktop"))]
+                    mapping_id: None,
+                }
+            }
+            StreamTarget::Window { id } => {
+                return Err(fdo::Error::Failed(format!(
+                    "Window target {id} has no available logical geometry"
+                )));
+            }
+        })
+    }
+
+    /// Starts this stream of an already started session.
+    #[zbus(name = "Start")]
+    async fn start_dbus(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+    ) -> fdo::Result<()> {
+        debug!("start");
+
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        if let Some(iface) = &self.rd_session {
+            iface
+                .get()
+                .await
+                .authorize_linked_screencast(connection, &header)
+                .await?;
+        }
+
+        #[cfg(not(feature = "xdp-gnome-remote-desktop"))]
+        let _ = (&header, connection);
+
+        self.start(ctxt.to_owned());
+        Ok(())
+    }
+}
+
+impl Stream {
+    /// Returns the current logical geometry for an output stream.
+    ///
+    /// Window streams do not expose live geometry through the compositor IPC state.
+    #[cfg(feature = "xdp-gnome-remote-desktop")]
+    pub(crate) fn logical_geometry(
+        &self,
+        outputs: &IpcOutputMap,
+    ) -> Option<niri_ipc::LogicalOutput> {
+        let StreamTarget::Output(target) = &self.target else {
+            return None;
+        };
+        outputs
+            .values()
+            .find(|output| output.name == target.name)
+            .and_then(|output| output.logical)
+    }
+
+    /// Starts this stream.
+    fn start(&self, ctxt: SignalEmitter<'static>) {
+        if self.was_started.load(Ordering::SeqCst) {
+            return;
+        }
+        self.was_started.store(true, Ordering::SeqCst);
+
+        let msg = ScreenCastToNiri::StartStream {
+            session_id: self.session_id,
+            stream_id: self.id,
+            target: self.target.make_id(),
+            cursor_mode: self.cursor_mode,
+            signal_ctx: ctxt,
+        };
+
+        if let Err(err) = self.to_niri.send(msg) {
+            warn!("error sending StartStream to niri: {err:?}");
+        }
+    }
+}
+fn requested_output_name<'a>(
+    connector: &'a str,
+    selected_output: Option<&'a str>,
+) -> Option<&'a str> {
+    if connector.is_empty() {
+        selected_output
+    } else {
+        Some(connector)
+    }
+}
+
+fn validate_logical_geometry<T>(output_name: &str, logical: Option<&T>) -> fdo::Result<()> {
+    if logical.is_some() {
+        Ok(())
+    } else {
+        Err(fdo::Error::Failed(format!(
+            "Monitor {output_name} has no logical geometry"
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{requested_output_name, validate_logical_geometry};
+
+    #[test]
+    fn empty_connector_uses_selected_non_dp2_output() {
+        assert_eq!(requested_output_name("", Some("eDP-1")), Some("eDP-1"));
+    }
+
+    #[test]
+    fn explicit_connector_is_preserved() {
+        assert_eq!(
+            requested_output_name("HDMI-A-1", Some("eDP-1")),
+            Some("HDMI-A-1"),
+        );
+    }
+
+    #[test]
+    fn empty_connector_without_selection_has_no_output() {
+        assert_eq!(requested_output_name("", None), None);
+    }
+
+    #[test]
+    fn monitor_without_logical_geometry_is_rejected() {
+        let error = validate_logical_geometry("eDP-1", Option::<&()>::None).unwrap_err();
+        assert!(matches!(
+            error,
+            super::fdo::Error::Failed(message) if message == "Monitor eDP-1 has no logical geometry"
+        ));
+    }
+
+    #[test]
+    fn monitor_with_logical_geometry_is_accepted() {
+        assert!(validate_logical_geometry("eDP-1", Some(&())).is_ok());
     }
 }

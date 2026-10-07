@@ -57,6 +57,10 @@ use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
 
 pub mod backend_ext;
 pub mod click_grab;
+#[cfg(feature = "xdp-gnome-remote-desktop")]
+pub mod dbus_remote_desktop_backend;
+#[cfg(feature = "xdp-gnome-remote-desktop")]
+pub mod eis_backend;
 pub mod move_grab;
 pub mod pick_color_grab;
 pub mod pick_window_grab;
@@ -267,9 +271,7 @@ impl State {
             let desc = TabletDescriptor::from(&device);
             tablet_seat.add_wp_tablet(&self.niri.display_handle, &desc);
         }
-        if device.has_capability(DeviceCapability::Touch) && self.niri.seat.get_touch().is_none() {
-            self.niri.seat.add_touch();
-        }
+        self.refresh_wayland_device_caps();
     }
 
     fn on_device_removed(&mut self, device: impl Device) {
@@ -284,7 +286,20 @@ impl State {
                 tablet_seat.clear_tools();
             }
         }
-        if device.has_capability(DeviceCapability::Touch) && self.niri.touch.is_empty() {
+        self.refresh_wayland_device_caps();
+    }
+
+    /// Updates the seat touch device when physical or emulated touch devices change.
+    pub fn refresh_wayland_device_caps(&mut self) {
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        let remote_touch_needed = self.niri.remote_desktop.needs_touch_cap();
+        #[cfg(not(feature = "xdp-gnome-remote-desktop"))]
+        let remote_touch_needed = false;
+
+        let touch_cap_needed = !self.niri.touch.is_empty() || remote_touch_needed;
+        if touch_cap_needed && self.niri.seat.get_touch().is_none() {
+            self.niri.seat.add_touch();
+        } else if !touch_cap_needed && self.niri.seat.get_touch().is_some() {
             self.niri.seat.remove_touch();
         }
     }
@@ -464,7 +479,11 @@ impl State {
         #[cfg(not(feature = "dbus"))]
         let _ = consumed_by_a11y;
 
-        let Some(Some(bind)) = self.niri.seat.get_keyboard().unwrap().input(
+        // Get the keyboard source from the event's device for origin-aware tracking.
+        let source = event.device().source();
+
+        let Some(Some(bind)) = self.niri.seat.get_keyboard().unwrap().input_from_source(
+            source,
             self,
             event.key_code(),
             event.state(),
@@ -2791,6 +2810,18 @@ impl State {
         let button_code = event.button_code();
 
         let button_state = event.state();
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        {
+            let origin = event.device().id();
+            let pressed = button_state == ButtonState::Pressed;
+            if !self
+                .niri
+                .remote_desktop
+                .update_pointer_button_origin(button_code, origin, pressed)
+            {
+                return;
+            }
+        }
 
         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
 
@@ -4301,7 +4332,14 @@ impl State {
         let Some(pos) = self.compute_touch_location(&evt) else {
             return;
         };
-        let slot = evt.slot();
+        let raw_slot = evt.slot();
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        let slot = self
+            .niri
+            .remote_desktop
+            .touch_slot(evt.device().id(), raw_slot);
+        #[cfg(not(feature = "xdp-gnome-remote-desktop"))]
+        let slot = raw_slot;
 
         let serial = SERIAL_COUNTER.next_serial();
 
@@ -4422,16 +4460,32 @@ impl State {
                 time: evt.time(),
             },
         );
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        self.niri
+            .remote_desktop
+            .activate_touch_slot(evt.device().id(), raw_slot);
 
         // We're using touch, hide the pointer.
         self.niri.pointer_visibility = PointerVisibility::Disabled;
     }
     fn on_touch_up<I: InputBackend>(&mut self, evt: I::TouchUpEvent) {
+        let raw_slot = evt.slot();
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        let device_id = evt.device().id();
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        let slot = self
+            .niri
+            .remote_desktop
+            .touch_slot(device_id.clone(), raw_slot);
+        #[cfg(not(feature = "xdp-gnome-remote-desktop"))]
+        let slot = raw_slot;
         let Some(handle) = self.niri.seat.get_touch() else {
+            #[cfg(feature = "xdp-gnome-remote-desktop")]
+            self.niri
+                .remote_desktop
+                .release_touch_slot(device_id, raw_slot);
             return;
         };
-        let slot = evt.slot();
-
         if let Some(capture) = self.niri.screenshot_ui.pointer_up(Some(slot)) {
             if capture {
                 self.confirm_screenshot(true);
@@ -4448,7 +4502,11 @@ impl State {
                 serial,
                 time: evt.time(),
             },
-        )
+        );
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        self.niri
+            .remote_desktop
+            .release_touch_slot(device_id, raw_slot);
     }
     fn on_touch_motion<I: InputBackend>(&mut self, evt: I::TouchMotionEvent) {
         let Some(handle) = self.niri.seat.get_touch() else {
@@ -4457,7 +4515,14 @@ impl State {
         let Some(pos) = self.compute_touch_location(&evt) else {
             return;
         };
-        let slot = evt.slot();
+        let raw_slot = evt.slot();
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        let slot = self
+            .niri
+            .remote_desktop
+            .touch_slot(evt.device().id(), raw_slot);
+        #[cfg(not(feature = "xdp-gnome-remote-desktop"))]
+        let slot = raw_slot;
 
         if let Some(output) = self.niri.screenshot_ui.selection_output().cloned() {
             let geom = self.niri.global_space.output_geometry(&output).unwrap();
@@ -4497,11 +4562,65 @@ impl State {
         };
         handle.frame(self);
     }
-    fn on_touch_cancel<I: InputBackend>(&mut self, _evt: I::TouchCancelEvent) {
+    fn on_touch_cancel<I: InputBackend>(&mut self, evt: I::TouchCancelEvent) {
+        let touch_slot = evt.slot();
+        let has_touch_slot = touch_slot != Default::default();
         let Some(handle) = self.niri.seat.get_touch() else {
+            #[cfg(feature = "xdp-gnome-remote-desktop")]
+            if has_touch_slot {
+                self.niri
+                    .remote_desktop
+                    .cancel_touch_slot(&evt.device().id(), touch_slot);
+            } else {
+                self.niri
+                    .remote_desktop
+                    .cancel_touch_slots(&evt.device().id());
+            }
             return;
         };
-        handle.cancel(self);
+
+        if has_touch_slot {
+            #[cfg(feature = "xdp-gnome-remote-desktop")]
+            let slot = self
+                .niri
+                .remote_desktop
+                .cancel_touch_slot(&evt.device().id(), touch_slot);
+            #[cfg(not(feature = "xdp-gnome-remote-desktop"))]
+            let slot = Some(touch_slot);
+
+            if let Some(slot) = slot {
+                handle.up(
+                    self,
+                    &UpEvent {
+                        slot,
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time: evt.time(),
+                    },
+                );
+                handle.frame(self);
+            }
+        } else {
+            #[cfg(feature = "xdp-gnome-remote-desktop")]
+            {
+                let slots = self
+                    .niri
+                    .remote_desktop
+                    .cancel_touch_slots(&evt.device().id());
+                for slot in slots {
+                    handle.up(
+                        self,
+                        &UpEvent {
+                            slot,
+                            serial: SERIAL_COUNTER.next_serial(),
+                            time: evt.time(),
+                        },
+                    );
+                }
+                handle.frame(self);
+            }
+            #[cfg(not(feature = "xdp-gnome-remote-desktop"))]
+            handle.cancel(self);
+        }
     }
 
     fn on_switch_toggle<I: InputBackend>(&mut self, evt: I::SwitchToggleEvent) {
